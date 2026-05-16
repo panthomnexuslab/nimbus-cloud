@@ -1,0 +1,30 @@
+{
+  "name": "nimbus-cloud",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Nimbus Cloud — Private. Secure. Everywhere.",
+  "packageManager": "pnpm@9.15.1",
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter=./apps/* build",
+    "dev": "pnpm -r --parallel --filter=./apps/* dev",
+    "lint": "pnpm -r --parallel lint",
+    "typecheck": "pnpm -r --parallel typecheck",
+    "test": "pnpm -r --parallel test",
+    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md,yml,yaml}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,js,jsx,json,md,yml,yaml}\"",
+    "api:dev": "pnpm --filter @nimbus/api dev",
+    "web:dev": "pnpm --filter @nimbus/web dev",
+    "prisma:generate": "pnpm --filter @nimbus/api prisma:generate",
+    "prisma:migrate": "pnpm --filter @nimbus/api prisma:migrate",
+    "docker:up": "docker compose -f docker-compose.yml up -d",
+    "docker:down": "docker compose -f docker-compose.yml down"
+  },
+  "devDependencies": {
+    "prettier": "^3.3.3",
+    "typescript": "^5.6.3"
+  }
+}

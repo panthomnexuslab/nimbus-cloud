@@ -1,0 +1,53 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build outputs
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+# env
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# logs
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.recommended.json
+
+# coverage / cache
+coverage/
+.nyc_output/
+.cache/
+.turbo/
+.eslintcache
+
+# prisma
+apps/api/prisma/migrations/dev.db*
+
+# uploads / local data
+.data/
+storage/
+quarantine/
+
+# docker
+.docker/
+
+# generated
+*.generated.ts

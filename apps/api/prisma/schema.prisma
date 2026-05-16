@@ -1,0 +1,575 @@
+// =====================================================================
+// Nimbus Cloud — Prisma schema
+// =====================================================================
+// All identifiers are UUIDs to avoid IDOR-friendly sequential ids.
+// All timestamps are UTC. Soft-delete is via `deletedAt` columns and the
+// dedicated RecycleBin entries.
+// =====================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextSearchPostgres"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------
+// Users & identity
+// ---------------------------------------------------------------------
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  PENDING_VERIFICATION
+  LOCKED
+  DISABLED
+  DELETED
+}
+
+model User {
+  id                  String     @id @default(uuid()) @db.Uuid
+  email               String     @unique
+  emailVerifiedAt     DateTime?
+  // Argon2id hash. Null when user signed up exclusively via OAuth.
+  passwordHash        String?
+  displayName         String     @default("")
+  avatarUrl           String?
+  role                UserRole   @default(USER)
+  status              UserStatus @default(PENDING_VERIFICATION)
+
+  // Per-user wrapped Data Encryption Key (DEK). The KEK that wraps this
+  // value never leaves the server's memory (loaded from MASTER_KEK_HEX
+  // and rotated via re-wrapping). See EncryptionKey for object-level
+  // keys.
+  wrappedDek          Bytes?
+  dekVersion          Int        @default(1)
+
+  // Storage quota in bytes. Null means platform default.
+  storageQuotaBytes   BigInt?
+  storageUsedBytes    BigInt     @default(0)
+
+  twoFactor           TwoFactor?
+
+  // Brute-force lockout fields. `failedLoginCount` resets after a
+  // successful login.
+  failedLoginCount    Int        @default(0)
+  lockedUntil         DateTime?
+
+  // Suspicious-login email/Webhook notifications.
+  loginAlertsEnabled  Boolean    @default(true)
+
+  // Trusted devices that bypass step-up auth.
+  trustedDevices      TrustedDevice[]
+
+  sessions            Session[]
+  refreshTokens       RefreshToken[]
+  oauthAccounts       OAuthAccount[]
+  files               File[]
+  folders             Folder[]
+  uploads             Upload[]
+  deviceLogs          DeviceLog[]
+  auditLogs           AuditLog[]
+  sharedLinks         SharedLink[]
+  encryptionKeys      EncryptionKey[]
+  recycleBinEntries   RecycleBinEntry[]
+  recoveryCodes       RecoveryCode[]
+  ipBans              IpBan[]   @relation("BannedByAdmin")
+
+  createdAt           DateTime   @default(now())
+  updatedAt           DateTime   @updatedAt
+  deletedAt           DateTime?
+
+  @@index([status])
+  @@index([role])
+  @@index([deletedAt])
+}
+
+// 2FA configuration is split out so the secret can be stored
+// separately and rotated without touching the User row.
+model TwoFactor {
+  id           String   @id @default(uuid()) @db.Uuid
+  userId       String   @unique @db.Uuid
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // TOTP shared secret, encrypted with the server KEK.
+  secretCipher Bytes
+  enabled      Boolean  @default(false)
+  confirmedAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+// One-time recovery codes for 2FA. Stored as Argon2 hashes; once used,
+// `usedAt` is set and the code cannot be replayed.
+model RecoveryCode {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash  String
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// Social/OAuth linked accounts.
+model OAuthAccount {
+  id              String   @id @default(uuid()) @db.Uuid
+  userId          String   @db.Uuid
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider        String   // "google" | "github" | ...
+  providerUserId  String
+  email           String?
+  createdAt       DateTime @default(now())
+
+  @@unique([provider, providerUserId])
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------
+// Sessions, refresh tokens, devices
+// ---------------------------------------------------------------------
+
+model Session {
+  id            String    @id @default(uuid()) @db.Uuid
+  userId        String    @db.Uuid
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Hash of the session id stored in cookie; never store the raw value.
+  sessionTokenHash String  @unique
+  deviceId      String?   @db.Uuid
+  device        TrustedDevice? @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  ipAddress     String?
+  userAgent     String?
+  fingerprint   String?
+  country       String?
+  city          String?
+  // For step-up authentication tracking.
+  mfaSatisfied  Boolean   @default(false)
+  lastSeenAt    DateTime  @default(now())
+  expiresAt     DateTime
+  revokedAt     DateTime?
+  createdAt     DateTime  @default(now())
+
+  refreshTokens RefreshToken[]
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([revokedAt])
+}
+
+// Refresh tokens are single-use & rotated. Reuse of an already-rotated
+// token triggers `replayedAt` and revocation of the entire session.
+model RefreshToken {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @db.Uuid
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessionId    String    @db.Uuid
+  session      Session   @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  // SHA-256 hash of the raw refresh token (the raw token is only sent
+  // to the client).
+  tokenHash    String    @unique
+  // Pointer to the token issued after rotation; lets us detect replay
+  // of an old token after rotation.
+  replacedById String?   @db.Uuid
+  replacedBy   RefreshToken?  @relation("RotationChain", fields: [replacedById], references: [id])
+  rotatedFrom  RefreshToken[] @relation("RotationChain")
+  replayedAt   DateTime?
+  revokedAt    DateTime?
+  expiresAt    DateTime
+  createdAt    DateTime  @default(now())
+
+  @@index([userId])
+  @@index([sessionId])
+  @@index([expiresAt])
+}
+
+model TrustedDevice {
+  id              String     @id @default(uuid()) @db.Uuid
+  userId          String     @db.Uuid
+  user            User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name            String
+  platform        String?
+  browser         String?
+  fingerprintHash String
+  trustedAt       DateTime?
+  lastSeenAt      DateTime   @default(now())
+  revokedAt       DateTime?
+  createdAt       DateTime   @default(now())
+
+  sessions        Session[]
+
+  @@unique([userId, fingerprintHash])
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------
+// Files, folders, uploads
+// ---------------------------------------------------------------------
+
+enum FileStatus {
+  PENDING       // upload created, no bytes yet
+  UPLOADING     // multipart in progress
+  QUARANTINED   // bytes received, awaiting scan/validation
+  SCANNING      // malware/content scan running
+  CLEAN         // available for download
+  INFECTED      // blocked: malware detected
+  REJECTED      // failed validation (type/size/policy)
+  DELETED       // soft-deleted (recycle bin)
+}
+
+enum StorageDriver {
+  R2
+  S3
+  LOCAL
+}
+
+model Folder {
+  id          String   @id @default(uuid()) @db.Uuid
+  ownerId     String   @db.Uuid
+  owner       User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  parentId    String?  @db.Uuid
+  parent      Folder?  @relation("FolderTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children    Folder[] @relation("FolderTree")
+  name        String
+  // Encrypted, server-searchable path for fast traversal; collapsed
+  // ancestor ids: `/uuid/uuid/uuid`.
+  pathIds     String
+  isFavorite  Boolean  @default(false)
+  color       String?
+  files       File[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  deletedAt   DateTime?
+
+  @@unique([ownerId, parentId, name])
+  @@index([ownerId])
+  @@index([parentId])
+  @@index([deletedAt])
+}
+
+model File {
+  id              String        @id @default(uuid()) @db.Uuid
+  ownerId         String        @db.Uuid
+  owner           User          @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  folderId        String?       @db.Uuid
+  folder          Folder?       @relation(fields: [folderId], references: [id], onDelete: SetNull)
+
+  // User-visible filename (validated against path-traversal etc.)
+  name            String
+  mimeType        String
+  extension       String?
+  sizeBytes       BigInt
+  // Hex sha-256 of plaintext bytes (computed client-side OR server-side
+  // post-scan). Used for dedup detection.
+  contentHash     String?
+
+  // Object storage location:
+  storageDriver   StorageDriver
+  storageBucket   String
+  storageKey      String        // opaque object key, never user-controlled
+
+  // Encryption metadata. Per-object DEK is wrapped with the user KEK.
+  encryptionKeyId String?       @db.Uuid
+  encryptionKey   EncryptionKey? @relation(fields: [encryptionKeyId], references: [id])
+  ivBase64        String?       // AES-GCM 12-byte IV for content encryption (encoded)
+  authTagBase64   String?       // AES-GCM 16-byte authentication tag (encoded)
+
+  // Smart gallery / search support.
+  thumbnailKey    String?
+  previewKey      String?
+  width           Int?
+  height          Int?
+  durationSeconds Int?
+  tags            String[]      @default([])
+
+  status          FileStatus    @default(PENDING)
+  isFavorite      Boolean       @default(false)
+
+  uploads         Upload[]
+  sharedLinks     SharedLink[]
+  scans           MalwareScanResult[]
+  recycleBinEntry RecycleBinEntry?
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  deletedAt       DateTime?
+
+  @@index([ownerId, status])
+  @@index([ownerId, folderId])
+  @@index([ownerId, deletedAt])
+  @@index([contentHash])
+}
+
+enum UploadStatus {
+  INITIATED
+  IN_PROGRESS
+  COMPLETED
+  ABORTED
+  FAILED
+  EXPIRED
+}
+
+model Upload {
+  id                String       @id @default(uuid()) @db.Uuid
+  ownerId           String       @db.Uuid
+  owner             User         @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  fileId            String?      @db.Uuid
+  file              File?        @relation(fields: [fileId], references: [id], onDelete: SetNull)
+
+  // Quarantine object that holds bytes until scanned.
+  quarantineDriver  StorageDriver
+  quarantineBucket  String
+  quarantineKey     String
+
+  // Cloud-native multipart upload identifier (S3/R2 UploadId).
+  multipartId       String?
+  partSize          Int          @default(8388608) // 8 MiB
+  totalSize         BigInt
+  totalParts        Int
+  completedParts    Json         @default("[]")
+
+  // Client-declared mime type & filename for validation only.
+  declaredMime      String
+  declaredFilename  String
+
+  status            UploadStatus @default(INITIATED)
+  expiresAt         DateTime
+  completedAt       DateTime?
+
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  @@index([ownerId])
+  @@index([status])
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------
+// Encryption keys
+// ---------------------------------------------------------------------
+
+enum EncryptionScope {
+  USER       // wraps user's master DEK
+  FILE       // per-file content DEK
+  SHARE_LINK // ephemeral key for shared links
+}
+
+model EncryptionKey {
+  id           String          @id @default(uuid()) @db.Uuid
+  userId       String?         @db.Uuid
+  user         User?           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  scope        EncryptionScope
+  algorithm    String          @default("AES-256-GCM")
+  // Always stored wrapped (encrypted) — never plaintext.
+  wrappedKey   Bytes
+  // Version of the master KEK used to wrap this key. Lets us migrate
+  // when rotating the KEK.
+  kekVersion   Int             @default(1)
+  files        File[]
+  createdAt    DateTime        @default(now())
+  rotatedAt    DateTime?
+
+  @@index([userId, scope])
+}
+
+// ---------------------------------------------------------------------
+// Sharing
+// ---------------------------------------------------------------------
+
+enum ShareAccess {
+  VIEW
+  DOWNLOAD
+  EDIT
+}
+
+model SharedLink {
+  id              String      @id @default(uuid()) @db.Uuid
+  ownerId         String      @db.Uuid
+  owner           User        @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  fileId          String?     @db.Uuid
+  file            File?       @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  folderPathIds   String?     // for folder shares, ids on the path
+  // Random URL slug (base64url). The full token is `slug.secret` where
+  // `secret` is never stored — only its hash.
+  slug            String      @unique
+  secretHash      String?     // null when public link (no secret)
+  passwordHash    String?     // optional shared-link password (Argon2)
+  access          ShareAccess @default(VIEW)
+  expiresAt       DateTime?
+  maxDownloads    Int?
+  downloadCount   Int         @default(0)
+  revokedAt       DateTime?
+  createdAt       DateTime    @default(now())
+
+  @@index([ownerId])
+  @@index([fileId])
+}
+
+// ---------------------------------------------------------------------
+// Recycle bin
+// ---------------------------------------------------------------------
+
+model RecycleBinEntry {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @db.Uuid
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fileId       String?   @unique @db.Uuid
+  file         File?     @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  // Snapshot of folder path so we can restore even if parent was renamed.
+  originalPath String
+  purgeAt      DateTime
+  createdAt    DateTime  @default(now())
+
+  @@index([userId])
+  @@index([purgeAt])
+}
+
+// ---------------------------------------------------------------------
+// Audit, device, malware-scan logs
+// ---------------------------------------------------------------------
+
+enum DeviceLogEvent {
+  LOGIN_SUCCESS
+  LOGIN_FAILED
+  LOGOUT
+  TOKEN_REFRESH
+  TOKEN_REPLAYED
+  DEVICE_TRUSTED
+  DEVICE_REVOKED
+  MFA_VERIFIED
+  MFA_FAILED
+  PASSWORD_CHANGED
+  SUSPICIOUS_LOGIN
+}
+
+model DeviceLog {
+  id          String         @id @default(uuid()) @db.Uuid
+  userId      String         @db.Uuid
+  user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessionId   String?        @db.Uuid
+  deviceId    String?        @db.Uuid
+  event       DeviceLogEvent
+  ipAddress   String?
+  userAgent   String?
+  country     String?
+  city        String?
+  riskScore   Int            @default(0)
+  metadata    Json?
+  createdAt   DateTime       @default(now())
+
+  @@index([userId])
+  @@index([event])
+  @@index([createdAt])
+}
+
+enum AuditAction {
+  USER_REGISTERED
+  USER_VERIFIED_EMAIL
+  USER_DELETED
+  FILE_UPLOADED
+  FILE_DOWNLOADED
+  FILE_DELETED
+  FILE_RESTORED
+  FILE_SHARED
+  SHARE_REVOKED
+  FOLDER_CREATED
+  FOLDER_DELETED
+  ENCRYPTION_KEY_ROTATED
+  MFA_ENABLED
+  MFA_DISABLED
+  ADMIN_ACTION
+  IP_BANNED
+  IP_UNBANNED
+  QUOTA_CHANGED
+}
+
+model AuditLog {
+  id          String      @id @default(uuid()) @db.Uuid
+  userId      String?     @db.Uuid
+  user        User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+  actorId     String?     @db.Uuid  // who performed the action (admin id when impersonating)
+  action      AuditAction
+  resource    String?     // table name + id, e.g. "file:uuid"
+  ipAddress   String?
+  userAgent   String?
+  // Tamper-evident: prevHash links each log to the previous one, making
+  // the audit chain append-only.
+  prevHash    String?
+  hash        String?
+  metadata    Json?
+  createdAt   DateTime    @default(now())
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+enum ScanVerdict {
+  PENDING
+  CLEAN
+  INFECTED
+  UNAVAILABLE   // scanner could not run
+  ERROR
+}
+
+model MalwareScanResult {
+  id           String      @id @default(uuid()) @db.Uuid
+  fileId       String      @db.Uuid
+  file         File        @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  scanner      String      // "clamav" | "vt" | ...
+  verdict      ScanVerdict @default(PENDING)
+  threatName   String?
+  raw          Json?
+  scannedAt    DateTime    @default(now())
+
+  @@index([fileId])
+  @@index([verdict])
+}
+
+// ---------------------------------------------------------------------
+// IP bans / abuse
+// ---------------------------------------------------------------------
+
+model IpBan {
+  id          String   @id @default(uuid()) @db.Uuid
+  ip          String   @unique
+  reason      String
+  bannedById  String?  @db.Uuid
+  bannedBy    User?    @relation("BannedByAdmin", fields: [bannedById], references: [id], onDelete: SetNull)
+  expiresAt   DateTime?
+  createdAt   DateTime @default(now())
+
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------
+// Notifications (used by suspicious-login alerts and admin alerts).
+// ---------------------------------------------------------------------
+
+enum NotificationKind {
+  SUSPICIOUS_LOGIN
+  NEW_DEVICE
+  STORAGE_QUOTA_WARNING
+  STORAGE_QUOTA_EXCEEDED
+  ADMIN_ALERT
+  SHARE_OPENED
+}
+
+model Notification {
+  id        String           @id @default(uuid()) @db.Uuid
+  userId    String           @db.Uuid
+  kind      NotificationKind
+  title     String
+  body      String
+  readAt    DateTime?
+  metadata  Json?
+  createdAt DateTime         @default(now())
+
+  @@index([userId, readAt])
+}
