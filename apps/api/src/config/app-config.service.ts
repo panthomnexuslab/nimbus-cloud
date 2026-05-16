@@ -82,6 +82,11 @@ const ConfigSchema = z.object({
   DEFAULT_STORAGE_QUOTA_BYTES: z.coerce.bigint().default(200n * 1024n * 1024n * 1024n),
   DEFAULT_MAX_UPLOAD_BYTES: z.coerce.bigint().default(10n * 1024n * 1024n * 1024n),
 
+  UPLOAD_URL_TTL: z.coerce.number().int().positive().default(900),
+  DOWNLOAD_URL_TTL: z.coerce.number().int().positive().default(600),
+  SHARE_LINK_DEFAULT_TTL_HOURS: z.coerce.number().int().positive().default(24 * 7),
+  RECYCLE_BIN_PURGE_DAYS: z.coerce.number().int().positive().default(30),
+
   ADMIN_BOOTSTRAP_EMAIL: z.string().email().optional().or(z.literal('')),
   ADMIN_BOOTSTRAP_PASSWORD: z.string().min(12).optional().or(z.literal('')),
 
@@ -200,6 +205,10 @@ export class AppConfigService implements OnModuleInit {
 
   get defaultQuotaBytes() { return this.cfg.DEFAULT_STORAGE_QUOTA_BYTES; }
   get defaultMaxUploadBytes() { return this.cfg.DEFAULT_MAX_UPLOAD_BYTES; }
+  get uploadUrlTtl() { return this.cfg.UPLOAD_URL_TTL; }
+  get downloadUrlTtl() { return this.cfg.DOWNLOAD_URL_TTL; }
+  get shareLinkDefaultTtlHours() { return this.cfg.SHARE_LINK_DEFAULT_TTL_HOURS; }
+  get recycleBinPurgeDays() { return this.cfg.RECYCLE_BIN_PURGE_DAYS; }
 
   get adminBootstrap() {
     if (!this.cfg.ADMIN_BOOTSTRAP_EMAIL || !this.cfg.ADMIN_BOOTSTRAP_PASSWORD) return null;
