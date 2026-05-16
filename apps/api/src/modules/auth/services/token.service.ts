@@ -1,6 +1,6 @@
 import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { Prisma } from '@prisma/client';
+import { AuditAction, DeviceLogEvent, Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { AppConfigService } from '../../../config/app-config.service';
 import { PrismaService } from '../../../prisma/prisma.service';
@@ -9,6 +9,7 @@ import type {
   RefreshTokenPayload,
 } from '../../../common/types/auth.types';
 import { generateOpaqueToken, sha256Hex } from '../../../common/utils/crypto-utils';
+import { AuditService } from '../../audit/audit.service';
 
 export interface IssuedTokenPair {
   accessToken: string;
@@ -37,6 +38,7 @@ export class TokenService {
     private readonly cfg: AppConfigService,
     private readonly jwt: JwtService,
     private readonly prisma: PrismaService,
+    private readonly audit: AuditService,
   ) {}
 
   signAccessToken(payload: AccessTokenPayload): {
@@ -132,9 +134,26 @@ export class TokenService {
           where: { sessionId: existing.sessionId, revokedAt: null },
           data: { revokedAt: new Date() },
         });
+        await tx.deviceLog.create({
+          data: {
+            userId: existing.userId,
+            sessionId: existing.sessionId,
+            event: DeviceLogEvent.TOKEN_REPLAYED,
+            metadata: { tokenId: existing.id },
+          },
+        });
         this.logger.warn(
           `Refresh token replay detected for session ${existing.sessionId}; session revoked.`,
         );
+        // Audit outside of the transaction-affecting writes; AuditService
+        // takes its own write so we don't accidentally chain inside a
+        // failed tx. Fire-and-forget; failures get logged.
+        void this.audit.append({
+          userId: existing.userId,
+          action: AuditAction.TOKEN_REUSE_DETECTED,
+          resource: `session:${existing.sessionId}`,
+          metadata: { tokenId: existing.id },
+        });
         throw new UnauthorizedException('Token replay detected');
       }
       if (existing.expiresAt < new Date()) {
@@ -159,6 +178,13 @@ export class TokenService {
       await tx.session.update({
         where: { id: existing.sessionId },
         data: { lastSeenAt: new Date() },
+      });
+      await tx.deviceLog.create({
+        data: {
+          userId: existing.userId,
+          sessionId: existing.sessionId,
+          event: DeviceLogEvent.TOKEN_REFRESH,
+        },
       });
 
       return { pair, sessionId: existing.sessionId, userId: existing.userId };

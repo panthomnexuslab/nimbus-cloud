@@ -68,6 +68,9 @@ model User {
   // Trusted devices that bypass step-up auth.
   trustedDevices      TrustedDevice[]
 
+  // WebAuthn / passkey credentials (passwordless + phishing-resistant).
+  passkeys            Passkey[]
+
   sessions            Session[]
   refreshTokens       RefreshToken[]
   oauthAccounts       OAuthAccount[]
@@ -114,6 +117,46 @@ model RecoveryCode {
   codeHash  String
   usedAt    DateTime?
   createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// WebAuthn / passkey-ready architecture. We store the public credential
+// material here and a counter to protect against cloned authenticators.
+// The actual ceremony (attestation/assertion) is wired up by the
+// `Passkey` module shipped in a follow-up release; the table is
+// here today so migrations don't break when the feature lands.
+enum PasskeyTransport {
+  USB
+  NFC
+  BLE
+  INTERNAL
+  HYBRID
+}
+
+model Passkey {
+  id              String              @id @default(uuid()) @db.Uuid
+  userId          String              @db.Uuid
+  user            User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  credentialId    Bytes               @unique
+  publicKey       Bytes
+  // Signature counter, monotonically increasing; reset implies cloning.
+  signCount       BigInt              @default(0)
+  // Friendly name shown in the security center (e.g. "iPhone 15", "YubiKey 5C").
+  label           String
+  // FIDO Authenticator Attestation GUID; lets us recognise the device model.
+  aaguid          String?
+  transports      PasskeyTransport[]  @default([])
+  // Whether this credential was created with userVerification: required
+  // (e.g. biometric). Lets us require step-up for high-value actions.
+  uvInitialized   Boolean             @default(false)
+  // Provider-reported backup state (used to warn if a passkey suddenly
+  // disappears from a synced credential set).
+  backupEligible  Boolean             @default(false)
+  backupState     Boolean             @default(false)
+  lastUsedAt      DateTime?
+  createdAt       DateTime            @default(now())
+  revokedAt       DateTime?
 
   @@index([userId])
 }
@@ -472,6 +515,23 @@ enum AuditAction {
   USER_REGISTERED
   USER_VERIFIED_EMAIL
   USER_DELETED
+  // Authentication events — every credential transition is auditable.
+  LOGIN_SUCCESS
+  LOGIN_FAILED
+  LOGOUT
+  PASSWORD_CHANGED
+  PASSWORD_RESET_REQUESTED
+  PASSWORD_RESET_COMPLETED
+  TOKEN_REFRESHED
+  TOKEN_REUSE_DETECTED
+  SUSPICIOUS_ACTIVITY
+  OAUTH_LINKED
+  OAUTH_UNLINKED
+  SESSION_REVOKED
+  DEVICE_REVOKED
+  PASSKEY_REGISTERED
+  PASSKEY_REMOVED
+  // Resource events
   FILE_UPLOADED
   FILE_DOWNLOADED
   FILE_DELETED
@@ -483,6 +543,7 @@ enum AuditAction {
   ENCRYPTION_KEY_ROTATED
   MFA_ENABLED
   MFA_DISABLED
+  // Administrative
   ADMIN_ACTION
   IP_BANNED
   IP_UNBANNED

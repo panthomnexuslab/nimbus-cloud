@@ -121,9 +121,10 @@ export class AuthService {
       await this.bumpFailedCount(user.id);
       await this.audit.append({
         userId: user.id,
-        action: AuditAction.USER_REGISTERED, // placeholder; specific login-fail logged via device log
+        action: AuditAction.LOGIN_FAILED,
         resource: `user:${user.id}`,
         client: ctx,
+        metadata: { reason: 'bad-password' },
       });
       await this.prisma.deviceLog.create({
         data: {
@@ -205,6 +206,13 @@ export class AuthService {
     if (user.loginAlertsEnabled) {
       await this.notifications.suspiciousLoginCheck(user.id, ctx);
     }
+    await this.audit.append({
+      userId: user.id,
+      action: AuditAction.LOGIN_SUCCESS,
+      resource: `session:${result.sessionId}`,
+      client: ctx,
+      metadata: { mfa: !!user.twoFactor?.enabled },
+    });
     return {
       status: 'OK',
       user: {
@@ -244,6 +252,16 @@ export class AuthService {
         metadata: { provider: profile.provider },
       },
     });
+    await this.audit.append({
+      userId: user.id,
+      action: AuditAction.LOGIN_SUCCESS,
+      resource: `session:${session.id}`,
+      client: ctx,
+      metadata: { oauth: profile.provider },
+    });
+    if (user.loginAlertsEnabled) {
+      await this.notifications.suspiciousLoginCheck(user.id, ctx);
+    }
     return { user, pair, sessionId: session.id };
   }
 
@@ -253,10 +271,16 @@ export class AuthService {
   }
 
   // --- Logout -----------------------------------------------------------
-  async logout(sessionId: string, userId: string) {
+  async logout(sessionId: string, userId: string, ctx?: ClientContext) {
     await this.sessions.revoke(sessionId, userId);
     await this.prisma.deviceLog.create({
       data: { userId, event: DeviceLogEvent.LOGOUT, sessionId },
+    });
+    await this.audit.append({
+      userId,
+      action: AuditAction.LOGOUT,
+      resource: `session:${sessionId}`,
+      client: ctx,
     });
   }
 
@@ -356,7 +380,7 @@ export class AuthService {
   }
 
   // --- Password change --------------------------------------------------
-  async changePassword(userId: string, current: string, next: string) {
+  async changePassword(userId: string, current: string, next: string, ctx?: ClientContext) {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user || !user.passwordHash) throw new NotFoundException();
     const ok = await this.password.verify(user.passwordHash, current);
@@ -364,11 +388,14 @@ export class AuthService {
     const hash = await this.password.hash(next);
     await this.prisma.user.update({ where: { id: userId }, data: { passwordHash: hash } });
     await this.sessions.revokeAllForUser(userId);
+    await this.prisma.deviceLog.create({
+      data: { userId, event: DeviceLogEvent.PASSWORD_CHANGED, ipAddress: ctx?.ip, userAgent: ctx?.userAgent },
+    });
     await this.audit.append({
       userId,
-      action: AuditAction.USER_REGISTERED, // password change action could be added; reusing
+      action: AuditAction.PASSWORD_CHANGED,
       resource: `user:${userId}`,
-      metadata: { event: 'password_changed' },
+      client: ctx,
     });
   }
 
